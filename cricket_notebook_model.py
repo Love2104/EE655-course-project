@@ -37,9 +37,9 @@ DROPOUT = 0.65
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_CHECKPOINT_CANDIDATES = [
-    PROJECT_ROOT / "results_current" / "checkpoints" / "p1_cnn_only.pth",
-    PROJECT_ROOT / "results_current" / "checkpoints" / "p1_gru.pth",
-    PROJECT_ROOT / "checkpoints" / "p1_cnn_only.pth",
+    PROJECT_ROOT / "results_current" / "checkpoints" / "phase1_cnn_only_uniform_checkpoint.pth",
+    PROJECT_ROOT / "results_current" / "checkpoints" / "phase1_gru_uniform_checkpoint.pth",
+    PROJECT_ROOT / "checkpoints" / "phase1_cnn_only_uniform_checkpoint.pth",
 ]
 
 

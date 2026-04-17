@@ -24,6 +24,11 @@ VOTING_OPTIONS = ["single", "majority", "weighted"]
 PROJECT_ROOT = Path(__file__).resolve().parent
 RESULTS_EXTRACT_DIR = PROJECT_ROOT / "results_current"
 HISTORY_FILE = PROJECT_ROOT / "recent_sessions.json"
+PHASE_SUMMARY_FILES = {
+    "phase1": "phase1_architecture_comparison.csv",
+    "phase2": "phase2_sampling_strategy_comparison.csv",
+    "phase3": "phase3_voting_strategy_evaluation.csv",
+}
 PHASE3_NOTEBOOK_ARCHITECTURE = "gru"
 PHASE3_NOTEBOOK_SAMPLING = "uniform"
 VOTING_TIE_BREAK = {
@@ -397,12 +402,8 @@ def get_bundle(checkpoint_path: str, strategy: str):
 
 
 @st.cache_data(show_spinner=False)
-def load_phase_summary(csv_name: str) -> pd.DataFrame:
-    path = RESULTS_DIR / csv_name
-    if not path.exists() and csv_name == "phase2.csv":
-        fallback = RESULTS_DIR / "phase2_corrected.csv"
-        if fallback.exists():
-            path = fallback
+def load_phase_summary(phase_key: str) -> pd.DataFrame:
+    path = RESULTS_DIR / PHASE_SUMMARY_FILES[phase_key]
     return pd.read_csv(path)
 
 
@@ -455,7 +456,7 @@ def compute_best_runtime_preset(catalog: list[dict[str, str]]) -> dict[str, Any]
         "source": "Phase 1 / Phase 2 notebook results",
     }
 
-    phase3 = load_phase_summary("phase3.csv")
+    phase3 = load_phase_summary("phase3")
     phase3_checkpoint = get_selected_checkpoint(catalog, PHASE3_NOTEBOOK_ARCHITECTURE, PHASE3_NOTEBOOK_SAMPLING)
     if not phase3.empty and phase3_checkpoint is not None and {"method", "correct"}.issubset(phase3.columns):
         phase3_summary = (
@@ -477,7 +478,7 @@ def compute_best_runtime_preset(catalog: list[dict[str, str]]) -> dict[str, Any]
             )
             return preset
 
-    phase1 = load_phase_summary("phase1.csv")
+    phase1 = load_phase_summary("phase1")
     if not phase1.empty and {"Architecture", "Test Acc %"}.issubset(phase1.columns):
         ranked_phase1 = phase1.sort_values("Test Acc %", ascending=False, ignore_index=True)
         for _, row in ranked_phase1.iterrows():
@@ -588,9 +589,9 @@ def add_history(mode: str, payload: dict[str, Any]) -> None:
 
 
 def render_experiment_summary(selected_checkpoint: dict[str, str] | None) -> None:
-    phase1 = load_phase_summary("phase1.csv")
-    phase2 = load_phase_summary("phase2.csv")
-    phase3 = load_phase_summary("phase3.csv")
+    phase1 = load_phase_summary("phase1")
+    phase2 = load_phase_summary("phase2")
+    phase3 = load_phase_summary("phase3")
 
     with st.expander("Notebook Experiment Results", expanded=False):
         tab_a, tab_b, tab_c, tab_d = st.tabs(
@@ -648,8 +649,8 @@ def render_experiment_summary(selected_checkpoint: dict[str, str] | None) -> Non
             if not selected_checkpoint:
                 st.info("Select a model to view notebook figures.")
             else:
-                curves = result_image_path("curves", selected_checkpoint["stem"])
-                confusion = result_image_path("cm", selected_checkpoint["stem"])
+                curves = result_image_path("training_curves", selected_checkpoint["stem"])
+                confusion = result_image_path("confusion_matrix", selected_checkpoint["stem"])
                 left, right = st.columns(2)
                 with left:
                     st.markdown("#### Training Curves")
