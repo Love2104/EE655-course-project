@@ -40,7 +40,7 @@ The repository is kept focused on the files needed to understand the project, ru
 
 - single-video shot classification
 - two-video similarity comparison
-- bounded live detection from a locally attached webcam or a video file
+- browser-camera capture for deployed use, plus live detection from a locally attached webcam or a video file
 - checkpoint selection from trained experiment outputs
 - multiple sampling strategies: `uniform`, `motion`, `hybrid`
 - multiple voting strategies: `single`, `majority`, `weighted`
@@ -212,7 +212,9 @@ http://localhost:8501
 
 ### Webcam note
 
-Live webcam mode uses OpenCV on the same machine that runs Streamlit. If you deploy the app to a hosted Linux server, Docker container, WSL session, or another remote environment, that server cannot access your laptop camera. In those cases, use `Video file` mode or run the app locally.
+For deployed apps, use the browser camera option in the live tab. The capture happens in the browser and is uploaded to Streamlit, so it works on hosted deployments too.
+
+The local webcam mode still uses OpenCV on the same machine that runs Streamlit. If you deploy the app to a hosted Linux server, Docker container, WSL session, or another remote environment, that server cannot access your laptop camera. In those cases, use the browser camera option, `Video file` mode, or run the app locally.
 
 ## How to Use the App
 

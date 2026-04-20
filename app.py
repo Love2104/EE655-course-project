@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
 import os
 import shutil
@@ -1206,6 +1207,55 @@ def run_live_detection(
     }
 
 
+def analyze_browser_camera_capture(bundle: Any, camera_capture: Any) -> dict[str, Any]:
+    image_bytes_data = camera_capture.getvalue()
+    pil_image = Image.open(io.BytesIO(image_bytes_data)).convert("RGB")
+    frame_rgb = np.asarray(pil_image)
+    frames = [frame_rgb.copy() for _ in range(NUM_FRAMES)]
+    tensor = frames_to_tensor(frames, bundle.transform)
+
+    with torch.no_grad():
+        with live_autocast_context():
+            probabilities = torch.softmax(bundle.model(tensor), dim=1).squeeze(0).cpu().numpy()
+
+    ordered_rows = live_probability_rows(probabilities)
+    top_prediction = ordered_rows[0]
+    event_table = pd.DataFrame(
+        [
+            {
+                "timestamp_sec": 0.0,
+                "shot_label": top_prediction["label"],
+                "confidence": top_prediction["probability"],
+            }
+        ]
+    )
+
+    return {
+        "summary": {
+            "label": str(top_prediction["label"]),
+            "confidence": round(float(top_prediction["probability"]), 2),
+            "events_detected": 1,
+            "frames_processed": NUM_FRAMES,
+            "average_fps": 0.0,
+            "duration_seconds": 0.0,
+        },
+        "metadata": {
+            "source_label": "Browser camera",
+            "checkpoint": str(bundle.checkpoint_path),
+            "strategy": bundle.strategy,
+            "architecture": bundle.architecture,
+            "voting_strategy": "browser_camera_snapshot",
+        },
+        "top_predictions": ordered_rows[:5],
+        "breakdown": ordered_rows,
+        "event_log": event_table.to_dict("records"),
+        "event_table": event_table,
+        "output_video": "",
+        "preview_image": image_bytes_data,
+        "preview_caption": "Captured browser camera frame",
+    }
+
+
 def build_live_report_payload(result: dict[str, Any]) -> dict[str, Any]:
     summary = result["summary"]
     metadata = result["metadata"]
@@ -1231,12 +1281,16 @@ def build_live_report_payload(result: dict[str, Any]) -> dict[str, Any]:
 
 def render_live_result(result: dict[str, Any]) -> None:
     summary = result["summary"]
+    metadata = result["metadata"]
     st.markdown('<div class="section-title">Live Detection Result</div>', unsafe_allow_html=True)
     a, b, c, d = st.columns(4)
     a.metric("Latest Shot", summary["label"])
     b.metric("Confidence", f"{summary['confidence']:.2f}%")
     c.metric("Events Logged", summary["events_detected"])
-    d.metric("Avg FPS", f"{summary['average_fps']:.2f}")
+    if metadata.get("source_label") == "Browser camera":
+        d.metric("Frames Used", summary["frames_processed"])
+    else:
+        d.metric("Avg FPS", f"{summary['average_fps']:.2f}")
 
     left, right = st.columns([1.1, 1.0])
     with left:
@@ -1248,12 +1302,17 @@ def render_live_result(result: dict[str, Any]) -> None:
         else:
             st.dataframe(result["event_table"], hide_index=True, use_container_width=True)
     with right:
-        st.markdown("#### Processed Stream")
-        output_video = result.get("output_video", "")
-        if output_video and Path(output_video).exists():
-            st.video(output_video)
+        st.markdown("#### Capture Output")
+        preview_image = result.get("preview_image")
+        if preview_image:
+            render_compatible_image(st, preview_image, use_container_width=True)
+            st.caption(result.get("preview_caption", "Captured frame"))
         else:
-            st.info("Processed output video could not be saved for this session.")
+            output_video = result.get("output_video", "")
+            if output_video and Path(output_video).exists():
+                st.video(output_video)
+            else:
+                st.info("Processed output video could not be saved for this session.")
 
     payload = build_live_report_payload(result)
     pdf = create_pdf_report(payload)
@@ -1465,14 +1524,18 @@ def main() -> None:
             """
             <div class="card">
                 <strong>Live mode</strong><br/>
-                Run bounded real-time inference from your local webcam or a video file. The live path uses the same
-                saved checkpoint selected in the sidebar and applies a sliding frame buffer with smoothed predictions.
+                Use your browser camera, a locally attached webcam, or a video file with the same checkpoint selected
+                in the sidebar. Browser camera works on deployed apps because capture happens in your browser first.
             </div>
             """,
             unsafe_allow_html=True,
         )
 
-        live_source = st.radio("Live source", ["Webcam", "Video file"], horizontal=True)
+        live_source = st.radio(
+            "Live source",
+            ["Browser camera", "Webcam (local server)", "Video file"],
+            horizontal=True,
+        )
         live_left, live_right = st.columns(2)
         with live_left:
             inference_stride = st.slider("Inference every N frames", min_value=1, max_value=8, value=4, step=1)
@@ -1489,21 +1552,29 @@ def main() -> None:
                 "Session duration limit in seconds (0 = no limit)",
                 min_value=0.0,
                 max_value=600.0,
-                value=20.0 if live_source == "Webcam" else 0.0,
+                value=20.0 if live_source == "Webcam (local server)" else 0.0,
                 step=5.0,
             )
             simulate_realtime = st.checkbox("Match original FPS for video files", value=True)
-            camera_index = st.number_input(
-                "Webcam device index",
-                min_value=0,
-                max_value=5,
-                value=0,
-                step=1,
-                help="Index 0 is usually the default camera. Try 1 or 2 if another app or device is mapped first.",
-            )
+            camera_index = 0
+            if live_source == "Webcam (local server)":
+                camera_index = st.number_input(
+                    "Webcam device index",
+                    min_value=0,
+                    max_value=5,
+                    value=0,
+                    step=1,
+                    help="Index 0 is usually the default camera. Try 1 or 2 if another app or device is mapped first.",
+                )
 
         live_upload = None
-        if live_source == "Video file":
+        browser_camera_capture = None
+        if live_source == "Browser camera":
+            browser_camera_capture = st.camera_input("Capture from browser camera", key="browser_camera")
+            st.caption(
+                "This works in deployed apps because the image is captured in your browser and uploaded to Streamlit."
+            )
+        elif live_source == "Video file":
             live_upload = st.file_uploader("Video stream file", type=SUPPORTED_TYPES, key="live_video")
             if live_upload:
                 render_video_preview(live_upload, "Live source video")
@@ -1518,8 +1589,12 @@ def main() -> None:
         status_placeholder = st.empty()
         progress_placeholder = st.empty()
 
-        live_disabled = live_source == "Video file" and live_upload is None
-        if st.button("Start Live Detection", type="primary", use_container_width=True, disabled=live_disabled):
+        live_disabled = (
+            (live_source == "Browser camera" and browser_camera_capture is None)
+            or (live_source == "Video file" and live_upload is None)
+        )
+        button_label = "Analyze Browser Camera" if live_source == "Browser camera" else "Start Live Detection"
+        if st.button(button_label, type="primary", use_container_width=True, disabled=live_disabled):
             try:
                 bundle = get_bundle(checkpoint_path, strategy)
             except Exception as exc:
@@ -1529,40 +1604,47 @@ def main() -> None:
             source_path = None
             source_value: int | str = int(camera_index)
             source_label = "Webcam"
-            if live_source == "Video file" and live_upload is not None:
+            if live_source == "Browser camera" and browser_camera_capture is not None:
+                st.session_state.live_result = None
+                try:
+                    st.session_state.live_result = analyze_browser_camera_capture(bundle, browser_camera_capture)
+                    status_placeholder.success("Browser camera frame analyzed successfully.")
+                except Exception as exc:
+                    st.error(str(exc))
+            elif live_source == "Video file" and live_upload is not None:
                 source_path = save_upload(live_upload)
                 source_value = source_path
                 source_label = "Video file"
-
-            st.session_state.live_result = None
-            try:
-                st.session_state.live_result = run_live_detection(
-                    bundle=bundle,
-                    source=source_value,
-                    source_label=source_label,
-                    inference_stride=inference_stride,
-                    smoothing_window=smoothing_window,
-                    confidence_threshold=confidence_threshold,
-                    max_seconds=float(max_seconds),
-                    simulate_realtime=bool(simulate_realtime),
-                    frame_placeholder=frame_placeholder,
-                    status_placeholder=status_placeholder,
-                    progress_placeholder=progress_placeholder,
-                )
-            except Exception as exc:
+            if live_source != "Browser camera":
                 st.session_state.live_result = None
-                status_placeholder.empty()
-                progress_placeholder.empty()
-                st.error(str(exc))
-            finally:
-                if source_path and os.path.exists(source_path):
-                    os.remove(source_path)
+                try:
+                    st.session_state.live_result = run_live_detection(
+                        bundle=bundle,
+                        source=source_value,
+                        source_label=source_label,
+                        inference_stride=inference_stride,
+                        smoothing_window=smoothing_window,
+                        confidence_threshold=confidence_threshold,
+                        max_seconds=float(max_seconds),
+                        simulate_realtime=bool(simulate_realtime),
+                        frame_placeholder=frame_placeholder,
+                        status_placeholder=status_placeholder,
+                        progress_placeholder=progress_placeholder,
+                    )
+                except Exception as exc:
+                    st.session_state.live_result = None
+                    status_placeholder.empty()
+                    progress_placeholder.empty()
+                    st.error(str(exc))
+                finally:
+                    if source_path and os.path.exists(source_path):
+                        os.remove(source_path)
 
         if st.session_state.live_result:
             render_live_result(st.session_state.live_result)
         else:
             st.markdown(
-                '<div class="card"><strong>Ready.</strong><br/>Choose webcam or a video file, then start a live detection session with the selected checkpoint.</div>',
+                '<div class="card"><strong>Ready.</strong><br/>Choose browser camera, local webcam, or a video file, then start detection with the selected checkpoint.</div>',
                 unsafe_allow_html=True,
             )
 
