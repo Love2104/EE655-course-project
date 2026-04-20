@@ -12,7 +12,7 @@ The project combines:
 - experiment summaries from architecture, sampling, and voting studies
 - downloadable PDF and JSON reports
 
-The repository has been cleaned and renamed so that files reflect their purpose clearly and the project can be understood quickly by an evaluator, teammate, or future maintainer.
+The repository is kept focused on the files needed to understand the project, run the Streamlit app locally, and review the final notebook-backed results.
 
 ## Objectives
 
@@ -181,6 +181,8 @@ These assets are intentionally kept in the repository because the app depends on
 
 ### 1. Create and activate a virtual environment
 
+The project was verified locally with Python `3.10`.
+
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\activate
@@ -189,13 +191,14 @@ python -m venv .venv
 ### 2. Install dependencies
 
 ```powershell
-pip install -r requirements.txt
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 ```
 
 ### 3. Start the Streamlit app
 
 ```powershell
-streamlit run app.py
+python -m streamlit run app.py
 ```
 
 ### 4. Open the local interface
@@ -254,4 +257,4 @@ For a two-video comparison, the app provides:
 
 ## Final Note
 
-This repository is organized as a final, presentation-ready course-project submission. The renamed artifacts, cleaned structure, and detailed documentation are intended to make evaluation straightforward and to clearly connect the frontend, inference pipeline, notebook work, and experimental outputs.
+This repository is organized as a final, presentation-ready course-project submission. Only the final reference notebook and the runtime assets required by the app are kept in version control, so teammates and evaluators can clone the repository and run it locally without local logs, cache files, or generated outputs getting in the way.
