@@ -5,17 +5,31 @@ import json
 import os
 import shutil
 import tempfile
+import time
 import zipfile
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import cv2
+import numpy as np
 import pandas as pd
 import streamlit as st
+import torch
 from PIL import Image
 
-from cricket_notebook_model import analyze_video, compare_analyses, create_pdf_report, find_checkpoint, load_bundle
+from cricket_notebook_model import (
+    CLASSES,
+    NUM_FRAMES,
+    analyze_video,
+    compare_analyses,
+    create_pdf_report,
+    find_checkpoint,
+    frames_to_tensor,
+    load_bundle,
+    sample_frames,
+)
 
 
 SUPPORTED_TYPES = ["mp4", "avi", "mov", "mkv"]
@@ -52,6 +66,17 @@ VOTING_LABELS = {
     "majority": "Majority Voting",
     "weighted": "Weighted Voting",
 }
+LIVE_VOTING_LABEL = "Streaming Average"
+LIVE_LOG_COOLDOWN = 1.5
+LIVE_OUTPUT_DIR = PROJECT_ROOT / "results_current" / "live_outputs"
+LIVE_CAPTURE_WIDTH = 640
+LIVE_CAPTURE_HEIGHT = 360
+LIVE_CAMERA_TARGET_FPS = 24
+LIVE_DISPLAY_EVERY = 2
+LIVE_STATUS_EVERY = 4
+LIVE_PROGRESS_EVERY = 6
+LIVE_PREVIEW_MAX_WIDTH = 960
+LIVE_PREVIEW_MAX_HEIGHT = 540
 
 
 def locate_latest_results_archive() -> Path | None:
@@ -298,6 +323,7 @@ st.markdown(
 def init_state() -> None:
     st.session_state.setdefault("single_result", None)
     st.session_state.setdefault("compare_result", None)
+    st.session_state.setdefault("live_result", None)
     if "history" not in st.session_state:
         st.session_state.history = load_history()
 
@@ -321,6 +347,40 @@ def save_upload(uploaded_file: Any) -> str:
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         tmp.write(uploaded_file.getbuffer())
         return tmp.name
+
+
+def render_compatible_image(target: Any, image: Any, **kwargs: Any) -> None:
+    try:
+        target.image(image, **kwargs)
+    except TypeError as exc:
+        if "use_container_width" not in str(exc):
+            raise
+        fallback_kwargs = dict(kwargs)
+        fallback_kwargs.pop("use_container_width", None)
+        fallback_kwargs.setdefault("use_column_width", True)
+        target.image(image, **fallback_kwargs)
+
+
+def frames_to_live_tensor(frames: list[np.ndarray]) -> torch.Tensor:
+    array = np.stack(frames).astype(np.float32) / 255.0
+    mean = np.asarray([0.485, 0.456, 0.406], dtype=np.float32)
+    std = np.asarray([0.229, 0.224, 0.225], dtype=np.float32)
+    array = (array - mean) / std
+    tensor = torch.from_numpy(array).permute(0, 3, 1, 2).unsqueeze(0)
+    return tensor.to(bundle_device(), non_blocking=True)
+
+
+def bundle_device() -> torch.device:
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def prepare_live_display_frame(frame_bgr: np.ndarray) -> np.ndarray:
+    height, width = frame_bgr.shape[:2]
+    scale = min(LIVE_PREVIEW_MAX_WIDTH / max(width, 1), LIVE_PREVIEW_MAX_HEIGHT / max(height, 1), 1.0)
+    if scale >= 0.999:
+        return frame_bgr
+    new_size = (max(int(width * scale), 1), max(int(height * scale), 1))
+    return cv2.resize(frame_bgr, new_size, interpolation=cv2.INTER_AREA)
 
 
 def convert_video_for_preview(source_path: str) -> bytes | None:
@@ -388,7 +448,7 @@ def render_video_preview(uploaded_file: Any, label: str) -> None:
             os.remove(source_path)
 
     if preview_bytes:
-        st.image(preview_bytes)
+        render_compatible_image(st, preview_bytes, use_container_width=True)
         st.caption(f"{label} AVI preview is shown as an animated GIF for browser compatibility.")
     else:
         st.info(
@@ -750,7 +810,7 @@ def render_analysis(analysis: dict[str, Any], heading: str) -> None:
     frame_cols = st.columns(max(1, min(4, len(analysis["key_frames"]))))
     for idx, frame in enumerate(analysis["key_frames"]):
         with frame_cols[idx % len(frame_cols)]:
-            st.image(image_bytes(frame), use_column_width=True)
+            render_compatible_image(st, image_bytes(frame), use_container_width=True)
             st.caption(f"{frame['label']} at {frame['time']:.2f}s | {frame['confidence']:.2f}%")
 
     st.markdown("#### Notes")
@@ -778,6 +838,372 @@ def render_download_buttons(result: dict[str, Any], mode: str) -> None:
             data=json.dumps(payload, indent=2).encode("utf-8"),
             file_name=f"cricket-shot-{report_name}.json",
             mime="application/json",
+            use_container_width=True,
+        )
+
+
+def format_shot_label(label: str) -> str:
+    return str(label).replace("_", " ").title()
+
+
+def live_probability_rows(probabilities: np.ndarray) -> list[dict[str, Any]]:
+    ordered = np.argsort(probabilities)[::-1]
+    return [
+        {
+            "label": format_shot_label(CLASSES[index]),
+            "probability": round(float(probabilities[index] * 100.0), 2),
+        }
+        for index in ordered
+    ]
+
+
+def smooth_live_predictions(
+    probability_history: deque[np.ndarray], confidence_threshold: float
+) -> dict[str, Any]:
+    if not probability_history:
+        return {
+            "label": "Detecting...",
+            "raw_label": None,
+            "confidence": 0.0,
+            "probabilities": np.zeros(len(CLASSES), dtype=np.float32),
+        }
+
+    averaged = np.mean(np.stack(probability_history), axis=0)
+    best_index = int(np.argmax(averaged))
+    confidence = float(averaged[best_index] * 100.0)
+    raw_label = format_shot_label(CLASSES[best_index])
+    return {
+        "label": raw_label if confidence >= confidence_threshold else "Detecting...",
+        "raw_label": raw_label,
+        "confidence": round(confidence, 2),
+        "probabilities": averaged,
+    }
+
+
+def draw_live_overlay(
+    frame: np.ndarray,
+    label: str,
+    confidence: float,
+    fps_value: float,
+    source_label: str,
+    checkpoint_name: str,
+) -> np.ndarray:
+    output = frame.copy()
+    height, width = output.shape[:2]
+    panel_height = 132
+    cv2.rectangle(output, (0, 0), (width, panel_height), (18, 24, 32), -1)
+    cv2.putText(output, f"Shot: {label}", (20, 38), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (77, 216, 100), 2, cv2.LINE_AA)
+    cv2.putText(
+        output,
+        f"Confidence: {confidence:.2f}%",
+        (20, 78),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.85,
+        (245, 245, 245),
+        2,
+        cv2.LINE_AA,
+    )
+    cv2.putText(output, f"FPS: {fps_value:.2f}", (20, 116), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (245, 245, 245), 2, cv2.LINE_AA)
+    cv2.putText(
+        output,
+        f"Source: {source_label}",
+        (width - 300, 38),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.8,
+        (245, 245, 245),
+        2,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        output,
+        f"Checkpoint: {checkpoint_name[:32]}",
+        (width - 430, 78),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.68,
+        (205, 212, 220),
+        2,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        output,
+        f"Buffer: {NUM_FRAMES} frames | Smoothing: {LIVE_VOTING_LABEL}",
+        (width - 430, 116),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        (205, 212, 220),
+        2,
+        cv2.LINE_AA,
+    )
+    return output
+
+
+def run_live_detection(
+    bundle: Any,
+    source: int | str,
+    source_label: str,
+    inference_stride: int,
+    smoothing_window: int,
+    confidence_threshold: float,
+    max_seconds: float,
+    simulate_realtime: bool,
+    frame_placeholder: Any,
+    status_placeholder: Any,
+    progress_placeholder: Any,
+) -> dict[str, Any]:
+    if isinstance(source, int) and os.name == "nt":
+        capture = cv2.VideoCapture(source, cv2.CAP_DSHOW)
+    else:
+        capture = cv2.VideoCapture(source)
+    if not capture.isOpened():
+        raise RuntimeError(f"Unable to open {source_label.lower()} source.")
+
+    if isinstance(source, int):
+        capture.set(cv2.CAP_PROP_FRAME_WIDTH, LIVE_CAPTURE_WIDTH)
+        capture.set(cv2.CAP_PROP_FRAME_HEIGHT, LIVE_CAPTURE_HEIGHT)
+        capture.set(cv2.CAP_PROP_FPS, LIVE_CAMERA_TARGET_FPS)
+        try:
+            capture.set(cv2.CAP_PROP_BUFFERSIZE, 2)
+        except Exception:
+            pass
+
+    fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
+    if fps <= 1:
+        fps = 25.0
+    width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH) or 960)
+    height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or 540)
+    total_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    source_is_video = not isinstance(source, int)
+
+    LIVE_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_path = LIVE_OUTPUT_DIR / f"live_detection_{stamp}.mp4"
+    writer = cv2.VideoWriter(str(output_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+    if not writer.isOpened():
+        output_path = None
+        writer = None
+
+    frame_buffer: deque[np.ndarray] = deque(maxlen=NUM_FRAMES)
+    probability_history: deque[np.ndarray] = deque(maxlen=smoothing_window)
+    event_log: list[dict[str, Any]] = []
+    current_state = smooth_live_predictions(probability_history, confidence_threshold)
+    frame_index = 0
+    fps_value = 0.0
+    last_tick = time.time()
+    stream_start = last_tick
+    next_frame_at = stream_start
+    last_rendered_frame = None
+    last_logged_label = ""
+    last_logged_time = -1e9
+
+    status_placeholder.info(f"Starting {source_label.lower()} inference with {Path(bundle.checkpoint_path).name}.")
+
+    try:
+        while True:
+            ok, frame = capture.read()
+            if not ok or frame is None:
+                break
+            if frame.size == 0:
+                continue
+
+            now = time.time()
+            frame_interval = max(now - last_tick, 1e-6)
+            fps_value = (0.9 * fps_value) + (0.1 * (1.0 / frame_interval)) if fps_value > 0 else (1.0 / frame_interval)
+            last_tick = now
+            frame_index += 1
+
+            resized_rgb = cv2.cvtColor(cv2.resize(frame, (224, 224)), cv2.COLOR_BGR2RGB)
+            frame_buffer.append(resized_rgb)
+
+            if len(frame_buffer) == NUM_FRAMES and frame_index % max(inference_stride, 1) == 0:
+                sampled_frames = sample_frames(list(frame_buffer), NUM_FRAMES, bundle.strategy)
+                tensor = frames_to_live_tensor(sampled_frames[:NUM_FRAMES])
+                with torch.no_grad():
+                    with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+                        probabilities = torch.softmax(bundle.model(tensor), dim=1).squeeze(0).cpu().numpy()
+                probability_history.append(probabilities)
+                current_state = smooth_live_predictions(probability_history, confidence_threshold)
+
+            if source_is_video:
+                timestamp_seconds = capture.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+                if timestamp_seconds <= 0:
+                    timestamp_seconds = frame_index / fps
+            else:
+                timestamp_seconds = time.time() - stream_start
+
+            if current_state["label"] != "Detecting..." and current_state["raw_label"] is not None:
+                if (
+                    current_state["raw_label"] != last_logged_label
+                    or (timestamp_seconds - last_logged_time) >= LIVE_LOG_COOLDOWN
+                ):
+                    event_log.append(
+                        {
+                            "timestamp_sec": round(float(timestamp_seconds), 2),
+                            "shot_label": current_state["raw_label"],
+                            "confidence": round(float(current_state["confidence"]), 2),
+                        }
+                    )
+                    last_logged_label = str(current_state["raw_label"])
+                    last_logged_time = float(timestamp_seconds)
+
+            overlay = draw_live_overlay(
+                frame=frame,
+                label=str(current_state["label"]),
+                confidence=float(current_state["confidence"]),
+                fps_value=float(fps_value),
+                source_label=source_label,
+                checkpoint_name=Path(bundle.checkpoint_path).name,
+            )
+            if frame_index % LIVE_DISPLAY_EVERY == 0 or frame_index == 1:
+                last_rendered_frame = prepare_live_display_frame(overlay)
+                render_compatible_image(frame_placeholder, last_rendered_frame, channels="BGR", use_container_width=True)
+
+            if writer is not None:
+                writer.write(overlay)
+
+            should_refresh_status = frame_index % LIVE_STATUS_EVERY == 0 or frame_index == 1
+            should_refresh_progress = frame_index % LIVE_PROGRESS_EVERY == 0 or frame_index == 1
+
+            if source_is_video and total_frames > 0 and should_refresh_progress:
+                progress_placeholder.progress(min(frame_index / total_frames, 1.0))
+
+            if should_refresh_status:
+                if source_is_video and total_frames > 0:
+                    status_placeholder.info(
+                        f"Processing {source_label.lower()} | frame {frame_index}/{total_frames} | "
+                        f"{current_state['label']} ({current_state['confidence']:.2f}%)"
+                    )
+                else:
+                    status_placeholder.info(
+                        f"Processing {source_label.lower()} | elapsed {timestamp_seconds:.2f}s | "
+                        f"{current_state['label']} ({current_state['confidence']:.2f}%)"
+                    )
+
+            if max_seconds > 0 and timestamp_seconds >= max_seconds:
+                break
+
+            if source_is_video and simulate_realtime:
+                next_frame_at += 1.0 / fps
+                sleep_time = next_frame_at - time.time()
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+    finally:
+        capture.release()
+        if writer is not None:
+            writer.release()
+
+    if source_is_video and total_frames > 0:
+        progress_placeholder.progress(1.0)
+
+    event_table = pd.DataFrame(event_log, columns=["timestamp_sec", "shot_label", "confidence"])
+    probabilities = np.asarray(current_state["probabilities"], dtype=np.float32)
+    top_predictions = live_probability_rows(probabilities)
+    duration_seconds = (
+        round(float(frame_index / fps), 2) if source_is_video else round(float(time.time() - stream_start), 2)
+    )
+    status_placeholder.success(
+        f"Live detection complete. Processed {frame_index} frames over {duration_seconds:.2f}s."
+    )
+
+    return {
+        "summary": {
+            "label": str(current_state["label"]),
+            "confidence": round(float(current_state["confidence"]), 2),
+            "events_detected": len(event_log),
+            "frames_processed": frame_index,
+            "average_fps": round(float(fps_value), 2),
+            "duration_seconds": duration_seconds,
+        },
+        "metadata": {
+            "source_label": source_label,
+            "checkpoint": str(bundle.checkpoint_path),
+            "strategy": bundle.strategy,
+            "architecture": bundle.architecture,
+            "voting_strategy": "streaming_average",
+        },
+        "top_predictions": top_predictions[:5],
+        "breakdown": top_predictions,
+        "event_log": event_log,
+        "event_table": event_table,
+        "output_video": str(output_path) if output_path is not None else "",
+    }
+
+
+def build_live_report_payload(result: dict[str, Any]) -> dict[str, Any]:
+    summary = result["summary"]
+    metadata = result["metadata"]
+    return {
+        "title": "Cricket Live Shot Detection Report",
+        "generatedAt": datetime.now().strftime("%d %b %Y, %I:%M %p"),
+        "summary": {
+            "label": summary["label"],
+            "confidence": summary["confidence"],
+            "architecture": metadata["architecture"],
+            "sampling": metadata["strategy"],
+            "voting": LIVE_VOTING_LABEL,
+        },
+        "topPredictions": result["top_predictions"],
+        "insights": [
+            f"Source mode: {metadata['source_label']}.",
+            f"Checkpoint used: {Path(metadata['checkpoint']).name}.",
+            f"Processed {summary['frames_processed']} frames across {summary['duration_seconds']:.2f}s.",
+            f"Logged {summary['events_detected']} confident shot events with streaming smoothing.",
+        ],
+    }
+
+
+def render_live_result(result: dict[str, Any]) -> None:
+    summary = result["summary"]
+    st.markdown('<div class="section-title">Live Detection Result</div>', unsafe_allow_html=True)
+    a, b, c, d = st.columns(4)
+    a.metric("Latest Shot", summary["label"])
+    b.metric("Confidence", f"{summary['confidence']:.2f}%")
+    c.metric("Events Logged", summary["events_detected"])
+    d.metric("Avg FPS", f"{summary['average_fps']:.2f}")
+
+    left, right = st.columns([1.1, 1.0])
+    with left:
+        st.markdown("#### Smoothed Predictions")
+        probability_rows(result["top_predictions"])
+        st.markdown("#### Shot Event Log")
+        if result["event_table"].empty:
+            st.info("No high-confidence live events were logged in this session.")
+        else:
+            st.dataframe(result["event_table"], hide_index=True, use_container_width=True)
+    with right:
+        st.markdown("#### Processed Stream")
+        output_video = result.get("output_video", "")
+        if output_video and Path(output_video).exists():
+            st.video(output_video)
+        else:
+            st.info("Processed output video could not be saved for this session.")
+
+    payload = build_live_report_payload(result)
+    pdf = create_pdf_report(payload)
+    json_bytes = json.dumps(payload, indent=2).encode("utf-8")
+    csv_bytes = result["event_table"].to_csv(index=False).encode("utf-8")
+    x, y, z = st.columns(3)
+    with x:
+        st.download_button(
+            "Download Live PDF",
+            data=pdf,
+            file_name="cricket-live-detection.pdf",
+            mime="application/pdf",
+            use_container_width=True,
+        )
+    with y:
+        st.download_button(
+            "Download Live JSON",
+            data=json_bytes,
+            file_name="cricket-live-detection.json",
+            mime="application/json",
+            use_container_width=True,
+        )
+    with z:
+        st.download_button(
+            "Download Event CSV",
+            data=csv_bytes,
+            file_name="cricket-live-events.csv",
+            mime="text/csv",
             use_container_width=True,
         )
 
@@ -891,67 +1317,164 @@ def main() -> None:
         st.warning("No checkpoint path found.")
         return
 
-    primary_col, secondary_col = st.columns(2)
-    with primary_col:
-        primary = st.file_uploader("Primary video", type=SUPPORTED_TYPES, key="primary")
-        if primary:
-            render_video_preview(primary, "Primary video")
-    with secondary_col:
-        secondary = st.file_uploader("Secondary video for comparison", type=SUPPORTED_TYPES, key="secondary")
-        if secondary:
-            render_video_preview(secondary, "Secondary video")
+    analysis_tab, live_tab = st.tabs(["Upload Analysis", "Live Detection"])
 
-    action = "Run Comparison" if secondary else "Run Analysis"
-    if st.button(action, type="primary", use_container_width=True, disabled=primary is None):
-        try:
-            bundle = get_bundle(checkpoint_path, strategy)
-        except Exception as exc:
-            st.error(str(exc))
-            return
+    with analysis_tab:
+        primary_col, secondary_col = st.columns(2)
+        with primary_col:
+            primary = st.file_uploader("Primary video", type=SUPPORTED_TYPES, key="primary")
+            if primary:
+                render_video_preview(primary, "Primary video")
+        with secondary_col:
+            secondary = st.file_uploader("Secondary video for comparison", type=SUPPORTED_TYPES, key="secondary")
+            if secondary:
+                render_video_preview(secondary, "Secondary video")
 
-        with st.spinner("Running notebook-based inference..."):
-            first_path = save_upload(primary)
-            second_path = save_upload(secondary) if secondary else None
+        action = "Run Comparison" if secondary else "Run Analysis"
+        if st.button(action, type="primary", use_container_width=True, disabled=primary is None):
             try:
-                first = analyze_video(first_path, bundle, voting_strategy=voting_strategy)
-                if secondary and second_path:
-                    second = analyze_video(second_path, bundle, voting_strategy=voting_strategy)
-                    result = compare_analyses(first, second)
-                    st.session_state.compare_result = result
-                    st.session_state.single_result = None
-                    add_history("compare", result)
-                else:
-                    st.session_state.single_result = first
-                    st.session_state.compare_result = None
-                    add_history("single", first)
-            finally:
-                if os.path.exists(first_path):
-                    os.remove(first_path)
-                if second_path and os.path.exists(second_path):
-                    os.remove(second_path)
+                bundle = get_bundle(checkpoint_path, strategy)
+            except Exception as exc:
+                st.error(str(exc))
+                return
 
-    if st.session_state.compare_result:
-        result = st.session_state.compare_result
-        render_report_panel(result, "compare")
-        render_download_buttons(result, "compare")
-        st.markdown('<div class="section-title">Similarity</div>', unsafe_allow_html=True)
-        st.metric("Similarity Score", f"{result['similarity_score']:.2f}%")
-        percent_bar(result["similarity_score"])
-        st.success(result["comparison_summary"])
-        left, right = st.columns(2)
-        with left:
-            render_analysis(result["video_a"], "Video A")
-        with right:
-            render_analysis(result["video_b"], "Video B")
-    elif st.session_state.single_result:
-        render_report_panel(st.session_state.single_result, "single")
-        render_download_buttons(st.session_state.single_result, "single")
-        render_analysis(st.session_state.single_result, "Recognition Result")
-    else:
+            with st.spinner("Running notebook-based inference..."):
+                first_path = save_upload(primary)
+                second_path = save_upload(secondary) if secondary else None
+                try:
+                    first = analyze_video(first_path, bundle, voting_strategy=voting_strategy)
+                    if secondary and second_path:
+                        second = analyze_video(second_path, bundle, voting_strategy=voting_strategy)
+                        result = compare_analyses(first, second)
+                        st.session_state.compare_result = result
+                        st.session_state.single_result = None
+                        add_history("compare", result)
+                    else:
+                        st.session_state.single_result = first
+                        st.session_state.compare_result = None
+                        add_history("single", first)
+                finally:
+                    if os.path.exists(first_path):
+                        os.remove(first_path)
+                    if second_path and os.path.exists(second_path):
+                        os.remove(second_path)
+
+        if st.session_state.compare_result:
+            result = st.session_state.compare_result
+            render_report_panel(result, "compare")
+            render_download_buttons(result, "compare")
+            st.markdown('<div class="section-title">Similarity</div>', unsafe_allow_html=True)
+            st.metric("Similarity Score", f"{result['similarity_score']:.2f}%")
+            percent_bar(result["similarity_score"])
+            st.success(result["comparison_summary"])
+            left, right = st.columns(2)
+            with left:
+                render_analysis(result["video_a"], "Video A")
+            with right:
+                render_analysis(result["video_b"], "Video B")
+        elif st.session_state.single_result:
+            render_report_panel(st.session_state.single_result, "single")
+            render_download_buttons(st.session_state.single_result, "single")
+            render_analysis(st.session_state.single_result, "Recognition Result")
+        else:
+            st.markdown(
+                '<div class="card"><strong>Ready.</strong><br/>Upload one video to classify it or two videos to compare them with the selected checkpoint.</div>',
+                unsafe_allow_html=True,
+            )
+
+    with live_tab:
         st.markdown(
-            '<div class="card"><strong>Ready.</strong><br/>Upload one video to classify it or two videos to compare them with the selected checkpoint.</div>',
+            """
+            <div class="card">
+                <strong>Live mode</strong><br/>
+                Run bounded real-time inference from your local webcam or a video file. The live path uses the same
+                saved checkpoint selected in the sidebar and applies a sliding frame buffer with smoothed predictions.
+            </div>
+            """,
             unsafe_allow_html=True,
         )
+
+        live_source = st.radio("Live source", ["Webcam", "Video file"], horizontal=True)
+        live_left, live_right = st.columns(2)
+        with live_left:
+            inference_stride = st.slider("Inference every N frames", min_value=1, max_value=8, value=4, step=1)
+            smoothing_window = st.slider("Prediction smoothing window", min_value=1, max_value=8, value=5, step=1)
+            confidence_threshold = st.slider(
+                "Confidence threshold (%)",
+                min_value=30.0,
+                max_value=95.0,
+                value=60.0,
+                step=5.0,
+            )
+        with live_right:
+            max_seconds = st.number_input(
+                "Session duration limit in seconds (0 = no limit)",
+                min_value=0.0,
+                max_value=600.0,
+                value=20.0 if live_source == "Webcam" else 0.0,
+                step=5.0,
+            )
+            simulate_realtime = st.checkbox("Match original FPS for video files", value=True)
+            camera_index = st.number_input("Webcam device index", min_value=0, max_value=5, value=0, step=1)
+
+        live_upload = None
+        if live_source == "Video file":
+            live_upload = st.file_uploader("Video stream file", type=SUPPORTED_TYPES, key="live_video")
+            if live_upload:
+                render_video_preview(live_upload, "Live source video")
+        else:
+            st.info("Webcam mode opens your local camera from the machine running Streamlit.")
+
+        frame_placeholder = st.empty()
+        status_placeholder = st.empty()
+        progress_placeholder = st.empty()
+
+        live_disabled = live_source == "Video file" and live_upload is None
+        if st.button("Start Live Detection", type="primary", use_container_width=True, disabled=live_disabled):
+            try:
+                bundle = get_bundle(checkpoint_path, strategy)
+            except Exception as exc:
+                st.error(str(exc))
+                return
+
+            source_path = None
+            source_value: int | str = int(camera_index)
+            source_label = "Webcam"
+            if live_source == "Video file" and live_upload is not None:
+                source_path = save_upload(live_upload)
+                source_value = source_path
+                source_label = "Video file"
+
+            st.session_state.live_result = None
+            try:
+                st.session_state.live_result = run_live_detection(
+                    bundle=bundle,
+                    source=source_value,
+                    source_label=source_label,
+                    inference_stride=inference_stride,
+                    smoothing_window=smoothing_window,
+                    confidence_threshold=confidence_threshold,
+                    max_seconds=float(max_seconds),
+                    simulate_realtime=bool(simulate_realtime),
+                    frame_placeholder=frame_placeholder,
+                    status_placeholder=status_placeholder,
+                    progress_placeholder=progress_placeholder,
+                )
+            except Exception as exc:
+                status_placeholder.empty()
+                progress_placeholder.empty()
+                st.error(str(exc))
+            finally:
+                if source_path and os.path.exists(source_path):
+                    os.remove(source_path)
+
+        if st.session_state.live_result:
+            render_live_result(st.session_state.live_result)
+        else:
+            st.markdown(
+                '<div class="card"><strong>Ready.</strong><br/>Choose webcam or a video file, then start a live detection session with the selected checkpoint.</div>',
+                unsafe_allow_html=True,
+            )
 
 
 if __name__ == "__main__":

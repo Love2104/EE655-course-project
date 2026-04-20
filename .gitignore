@@ -3,6 +3,10 @@
 __pycache__/
 *.py[cod]
 *.log
+install*_log.txt
+pip_list*.txt
+torch_install_log.txt
+venv_log.txt
 
 frontend/node_modules/
 frontend/dist/
@@ -14,3 +18,6 @@ results (1).zip
 recent_sessions.json
 streamlit.stdout.log
 streamlit.stderr.log
+streamlit_stdout.log
+streamlit_stderr.log
+results_current/live_outputs/
