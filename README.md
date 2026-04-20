@@ -40,6 +40,7 @@ The repository is kept focused on the files needed to understand the project, ru
 
 - single-video shot classification
 - two-video similarity comparison
+- bounded live detection from a locally attached webcam or a video file
 - checkpoint selection from trained experiment outputs
 - multiple sampling strategies: `uniform`, `motion`, `hybrid`
 - multiple voting strategies: `single`, `majority`, `weighted`
@@ -208,6 +209,10 @@ Streamlit will print a local URL in the terminal, usually:
 ```text
 http://localhost:8501
 ```
+
+### Webcam note
+
+Live webcam mode uses OpenCV on the same machine that runs Streamlit. If you deploy the app to a hosted Linux server, Docker container, WSL session, or another remote environment, that server cannot access your laptop camera. In those cases, use `Video file` mode or run the app locally.
 
 ## How to Use the App
 

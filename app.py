@@ -8,6 +8,7 @@ import tempfile
 import time
 import zipfile
 from collections import deque
+from contextlib import contextmanager, nullcontext
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -77,6 +78,7 @@ LIVE_STATUS_EVERY = 4
 LIVE_PROGRESS_EVERY = 6
 LIVE_PREVIEW_MAX_WIDTH = 960
 LIVE_PREVIEW_MAX_HEIGHT = 540
+OPENCV_LOG_LEVEL_SILENT = 0
 
 
 def locate_latest_results_archive() -> Path | None:
@@ -372,6 +374,79 @@ def frames_to_live_tensor(frames: list[np.ndarray]) -> torch.Tensor:
 
 def bundle_device() -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+@contextmanager
+def quiet_opencv_logging(level: int = OPENCV_LOG_LEVEL_SILENT):
+    get_level = getattr(cv2, "getLogLevel", None)
+    set_level = getattr(cv2, "setLogLevel", None)
+    if not callable(get_level) or not callable(set_level):
+        yield
+        return
+
+    previous_level = get_level()
+    set_level(level)
+    try:
+        yield
+    finally:
+        set_level(previous_level)
+
+
+def live_autocast_context() -> Any:
+    if torch.cuda.is_available():
+        return torch.amp.autocast(device_type="cuda")
+    return nullcontext()
+
+
+def camera_backend_candidates() -> list[tuple[str, int | None]]:
+    candidates: list[tuple[str, int | None]] = []
+    if os.name == "nt":
+        candidates.extend(
+            [
+                ("DirectShow", getattr(cv2, "CAP_DSHOW", None)),
+                ("Media Foundation", getattr(cv2, "CAP_MSMF", None)),
+            ]
+        )
+    else:
+        candidates.append(("V4L2", getattr(cv2, "CAP_V4L2", None)))
+    candidates.append(("Default", None))
+
+    deduped: list[tuple[str, int | None]] = []
+    seen: set[int | None] = set()
+    for label, backend in candidates:
+        if backend in seen:
+            continue
+        seen.add(backend)
+        deduped.append((label, backend))
+    return deduped
+
+
+def open_live_capture(source: int | str, source_label: str) -> tuple[Any, str]:
+    if not isinstance(source, int):
+        capture = cv2.VideoCapture(source)
+        if capture.isOpened():
+            return capture, "file"
+        capture.release()
+        raise RuntimeError(f"Unable to open the selected {source_label.lower()}.")
+
+    attempted_backends: list[str] = []
+    for backend_label, backend in camera_backend_candidates():
+        with quiet_opencv_logging():
+            if backend is None:
+                capture = cv2.VideoCapture(source)
+            else:
+                capture = cv2.VideoCapture(source, backend)
+        if capture.isOpened():
+            return capture, backend_label
+        capture.release()
+        attempted_backends.append(backend_label)
+
+    attempted = ", ".join(attempted_backends) if attempted_backends else "the available OpenCV backends"
+    raise RuntimeError(
+        f"Unable to access webcam index {source}. Tried {attempted}. "
+        "Webcam mode only works when Streamlit is running on the same computer as the camera. "
+        "If you are using a hosted Linux app, Docker, WSL, or a remote server, switch to Video file or run the app locally."
+    )
 
 
 def prepare_live_display_frame(frame_bgr: np.ndarray) -> np.ndarray:
@@ -950,12 +1025,7 @@ def run_live_detection(
     status_placeholder: Any,
     progress_placeholder: Any,
 ) -> dict[str, Any]:
-    if isinstance(source, int) and os.name == "nt":
-        capture = cv2.VideoCapture(source, cv2.CAP_DSHOW)
-    else:
-        capture = cv2.VideoCapture(source)
-    if not capture.isOpened():
-        raise RuntimeError(f"Unable to open {source_label.lower()} source.")
+    capture, capture_backend = open_live_capture(source, source_label)
 
     if isinstance(source, int):
         capture.set(cv2.CAP_PROP_FRAME_WIDTH, LIVE_CAPTURE_WIDTH)
@@ -1018,7 +1088,7 @@ def run_live_detection(
                 sampled_frames = sample_frames(list(frame_buffer), NUM_FRAMES, bundle.strategy)
                 tensor = frames_to_live_tensor(sampled_frames[:NUM_FRAMES])
                 with torch.no_grad():
-                    with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+                    with live_autocast_context():
                         probabilities = torch.softmax(bundle.model(tensor), dim=1).squeeze(0).cpu().numpy()
                 probability_history.append(probabilities)
                 current_state = smooth_live_predictions(probability_history, confidence_threshold)
@@ -1090,6 +1160,14 @@ def run_live_detection(
         capture.release()
         if writer is not None:
             writer.release()
+
+    if frame_index == 0:
+        if isinstance(source, int):
+            raise RuntimeError(
+                f"Webcam index {source} opened with {capture_backend}, but no frames were received. "
+                "Close any other app using the camera or try another device index."
+            )
+        raise RuntimeError("The selected video file opened, but no frames could be read from it.")
 
     if source_is_video and total_frames > 0:
         progress_placeholder.progress(1.0)
@@ -1415,7 +1493,14 @@ def main() -> None:
                 step=5.0,
             )
             simulate_realtime = st.checkbox("Match original FPS for video files", value=True)
-            camera_index = st.number_input("Webcam device index", min_value=0, max_value=5, value=0, step=1)
+            camera_index = st.number_input(
+                "Webcam device index",
+                min_value=0,
+                max_value=5,
+                value=0,
+                step=1,
+                help="Index 0 is usually the default camera. Try 1 or 2 if another app or device is mapped first.",
+            )
 
         live_upload = None
         if live_source == "Video file":
@@ -1423,7 +1508,11 @@ def main() -> None:
             if live_upload:
                 render_video_preview(live_upload, "Live source video")
         else:
-            st.info("Webcam mode opens your local camera from the machine running Streamlit.")
+            st.info("Webcam mode opens a camera attached to the same machine that is running Streamlit.")
+            st.caption(
+                "If the app is running on a hosted URL, WSL, Docker, or another remote Linux machine, "
+                "the server cannot use your laptop camera. In that case, run the app locally or use Video file."
+            )
 
         frame_placeholder = st.empty()
         status_placeholder = st.empty()
@@ -1461,6 +1550,7 @@ def main() -> None:
                     progress_placeholder=progress_placeholder,
                 )
             except Exception as exc:
+                st.session_state.live_result = None
                 status_placeholder.empty()
                 progress_placeholder.empty()
                 st.error(str(exc))
